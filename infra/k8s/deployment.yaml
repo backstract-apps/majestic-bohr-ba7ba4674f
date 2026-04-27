@@ -1,0 +1,125 @@
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: majestic-bohr-ba7ba4674f-bst-token
+  namespace: apps-prod
+  labels:
+    app: majestic-bohr-ba7ba4674f
+    managed-by: backstract
+  annotations:
+    backstract.io/token-scope: "storage.*,cache.*"
+type: Opaque
+stringData:
+  token: "PLACEHOLDER_BST_TOKEN_REPLACE_AT_RUNTIME"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: majestic-bohr-ba7ba4674f-depl
+  namespace: apps-prod
+  labels:
+    app: majestic-bohr-ba7ba4674f
+    release: prometheus # Added label for PodMonitor discovery
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: majestic-bohr-ba7ba4674f
+      release: prometheus # Added label for PodMonitor discovery
+  template:
+    metadata:
+      labels:
+        app: majestic-bohr-ba7ba4674f
+        release: prometheus # Added label for PodMonitor discovery
+    spec:
+      serviceAccountName: alloy-service-account
+      volumes:
+      - name: alloy-config
+        configMap:
+          name: alloy-configmap
+          items:
+          - key: alloy.river
+            path: config.alloy
+
+      - name: podinfo
+        downwardAPI:
+          items:
+          - path: "labels"
+            fieldRef:
+              fieldPath: metadata.labels
+          - path: "annotations"
+            fieldRef:
+              fieldPath: metadata.annotations
+      tolerations:
+        - key: "workload"
+          operator: "Equal"
+          value: "user"
+          effect: "NoSchedule"
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nodepool
+                    operator: In
+                    values: ["spot-users"]
+      containers:
+      - name: majestic-bohr-ba7ba4674f
+        image: 216084506783.dkr.ecr.ap-south-1.amazonaws.com/backstract_apps:majestic-bohr-ba7ba4674f
+        imagePullPolicy: Always
+        env:
+        - name: BACKSTRACT_AUTH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: majestic-bohr-ba7ba4674f-bst-token
+              key: token
+        - name: BACKSTRACT_PLATFORM_URL
+          value: "https://cc1fbde45ead-in-south-01.mayson.dev/sigma"
+        envFrom:
+        - configMapRef:
+            name: env-configmap-coll-f696cc86af994ff3b7a3facbeda06a42-deployment-dd78e9ee-3625-48c0-b799-15ddd46405f5
+        - secretRef:
+            name: app-secrets-coll-f696cc86af994ff3b7a3facbeda06a42
+        ports:
+        - containerPort: 7070
+          name: http # Optional for HTTP traffic
+        - containerPort: 7070 #same as the deployed code
+          name: metrics # Added port for metrics scraping
+        resources:
+          requests:
+            memory: "210Mi"
+            cpu: "200m"
+          limits:
+            memory: "500Mi"
+            cpu: "500m"
+
+      - name: alloy-sidecar
+        image: grafana/alloy:latest
+        args:
+        - "run"
+        - "/etc/alloy/config.alloy"
+        - "--server.http.listen-addr=0.0.0.0:12345"
+        ports:
+        - name: otlp-grpc
+          containerPort: 4317
+          protocol: TCP
+        - name: otlp-http
+          containerPort: 4318
+          protocol: TCP
+        - name: alloy-http
+          containerPort: 12345
+          protocol: TCP
+        volumeMounts:
+        - name: alloy-config
+          mountPath: /etc/alloy
+        - name: podinfo
+          mountPath: /etc/podinfo
+          readOnly: true
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "384Mi"
+            cpu: "300m"

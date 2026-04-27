@@ -1,0 +1,24 @@
+kind: HTTPScaledObject
+apiVersion: http.keda.sh/v1alpha1
+metadata:
+  name: majestic-bohr-ba7ba4674f-scaler
+  namespace: apps-prod
+spec:
+  hosts:
+    - cc1fbde45ead-in-south-01.mayson.dev
+  pathPrefixes:
+    - /us-east-2-backstractelb-ebf9f5-coll-f696cc86af994ff3b7a3facbeda06a42/ # e.g. /infallible-naveen-... majestic-bohr-ba7ba4674f/
+  scaleTargetRef:
+    name: majestic-bohr-ba7ba4674f-depl
+    kind: Deployment
+    apiVersion: apps/v1
+    service: majestic-bohr-ba7ba4674f-srv # e.g. coll-8a2a...-srv
+    port: 80
+  replicas:
+    min: 0
+    max: 10
+  scaledownPeriod: 604800 #inseconds
+  scalingMetric:
+    requestRate:
+      targetValue: 100
+      window: 1m

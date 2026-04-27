@@ -1,0 +1,98 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alloy-configmap
+  namespace: apps-prod
+data:
+  alloy.river: |
+    logging {
+      level  = "debug"
+      format = "logfmt"
+    }
+
+    // OTLP Receiver for traces, metrics, and logs from the application SDK
+    otelcol.receiver.otlp "app_otlp" {
+      grpc {
+        endpoint = "0.0.0.0:4317"
+      }
+      http {
+        endpoint = "0.0.0.0:4318"
+      }
+      output {
+        metrics = [otelcol.processor.batch.default.input]
+        logs    = [otelcol.processor.batch.default.input]
+      }
+    }
+
+    // Kubernetes Pod Discovery
+    discovery.kubernetes "pods" {
+      role = "pod"
+      // No relabel_configs directly here
+    }
+
+    // Relabel discovered pod targets to filter by container name
+    discovery.relabel "filtered_pods" {
+      targets = discovery.kubernetes.pods.targets // Input from pod discovery
+
+      // Define one or more relabeling rules
+      rule {
+        source_labels = ["__meta_kubernetes_pod_container_name"]
+        regex         = "majestic-bohr-ba7ba4674f" // User needs to provide this
+        action        = "keep"
+      }
+      // Optional: Add more rules if needed, e.g., to filter by pod labels
+      // rule {
+      //   source_labels = ["__meta_kubernetes_pod_label_app"]
+      //   regex         = ""
+      //   action        = "keep"
+      // }
+    }
+
+    // Kubernetes Logs Source
+    loki.source.kubernetes "app_logs" {
+      targets    = discovery.relabel.filtered_pods.output // Use targets from discovery.relabel
+      forward_to = [loki.write.main.receiver]
+    }
+
+
+
+    // Batch processor
+    otelcol.processor.batch "default" {
+      timeout         = "1s"
+      send_batch_size = 1024
+      output {
+        metrics = [otelcol.exporter.prometheus.default.input]
+        logs    = [otelcol.exporter.loki.default.input]
+      }
+    }
+
+    // Loki Exporter (for OTLP logs)
+    otelcol.exporter.loki "default" {
+      forward_to = [loki.write.main.receiver]
+    }
+
+
+
+
+    // Loki Writer
+    loki.write "main" {
+      endpoint {
+        url = "https://loki.backstract.io/loki/api/v1/push"
+      }
+      external_labels = {
+        environment = "majestic-bohr-ba7ba4674f",
+        source_type = "alloy_k8s_majestic-bohr-ba7ba4674f",
+      }
+    }
+
+    // Prometheus Exporter
+    otelcol.exporter.prometheus "default" {
+      forward_to = [prometheus.remote_write.main.receiver]
+    }
+
+    prometheus.remote_write "main" {
+      endpoint {
+        url = "https://prometheus.backstract.io/api/v1/write"
+
+      }
+    }

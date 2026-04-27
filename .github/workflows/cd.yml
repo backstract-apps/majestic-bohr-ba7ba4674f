@@ -1,0 +1,203 @@
+name: CD - Deploy to Cloud
+
+on:
+  push:
+    branches: [ master ]
+
+jobs:
+  deploy:
+    name: Build Docker image and Push to AWS ECR and Deploy to EKS
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_REGION: ap-south-1
+      EKS_CLUSTER: backstract-dev
+      NAMESPACE: apps-prod
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v3
+
+    - name: Setup job
+      uses: ./.github/actions/log-streamer
+      with:
+        step_name: "Setup job"
+        command: |
+          echo "Runner environment: $(uname -a)"
+          echo "Disk space: $(df -h / | tail -1)"
+          echo "Memory: $(free -h)"
+        endpoint: https://cc1fbde45ead-in-south-01.mayson.dev/sigma/api/v1/logs/github
+        token: none
+
+    - name: Checkout code
+      uses: ./.github/actions/log-streamer
+      with:
+        step_name: "Checkout code"
+        command: |
+          echo "Code checkout completed"
+          echo "Repository: ${{ github.repository }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Commit SHA: ${{ github.sha }}"
+          ls -la
+        endpoint: https://cc1fbde45ead-in-south-01.mayson.dev/sigma/api/v1/logs/github
+        token: none
+
+    - name: Install kubectl
+      uses: azure/setup-kubectl@v4
+      with:
+        version: 'v1.31.0'
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+
+    # 🚀 Enable Buildx
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    # 🚀 Cache layers
+    - name: Cache Docker layers
+      uses: actions/cache@v3
+      with:
+        path: /tmp/.buildx-cache
+        key: ${{ runner.os }}-buildx-${{ github.sha }}
+        restore-keys: |
+          ${{ runner.os }}-buildx-
+
+    # 🚀 Build image
+    - name: Build Docker image
+      uses: ./.github/actions/log-streamer
+      with:
+        step_name: "Build, tag, and push docker image to Amazon ECR"
+        command: |
+          docker buildx build \
+            --cache-from=type=local,src=/tmp/.buildx-cache \
+            --cache-to=type=local,dest=/tmp/.buildx-cache \
+            -t ${{ steps.login-ecr.outputs.registry }}/backstract_apps:${{ github.sha }} \
+            -t ${{ steps.login-ecr.outputs.registry }}/backstract_apps:majestic-bohr-ba7ba4674f \
+            -t ${{ steps.login-ecr.outputs.registry }}/backstract_apps:latest \
+            --load .
+        endpoint: https://cc1fbde45ead-in-south-01.mayson.dev/sigma/api/v1/logs/github
+        token: none
+
+    # 🚀 Push ONLY required tags
+    - name: Push Docker image to ECR
+      uses: ./.github/actions/log-streamer
+      with:
+        step_name: "Build, tag, and push docker image to Amazon ECR"
+        command: |
+          docker push ${{ steps.login-ecr.outputs.registry }}/backstract_apps:${{ github.sha }}
+          docker push ${{ steps.login-ecr.outputs.registry }}/backstract_apps:majestic-bohr-ba7ba4674f
+          docker push ${{ steps.login-ecr.outputs.registry }}/backstract_apps:latest
+        endpoint: https://cc1fbde45ead-in-south-01.mayson.dev/sigma/api/v1/logs/github
+        token: none
+
+    - name: Update kubeconfig
+      uses: ./.github/actions/log-streamer
+      with:
+        step_name: "Update kube config to point to EKS"
+        command: |
+          aws eks update-kubeconfig --name $EKS_CLUSTER --region $AWS_REGION
+        endpoint: https://cc1fbde45ead-in-south-01.mayson.dev/sigma/api/v1/logs/github
+        token: none
+
+    - name: Create Kubernetes secret dynamically
+      run: |
+        echo "${{ secrets.K8S_ENV_FILE }}" > .env
+
+        kubectl create secret generic app-secrets-coll-f696cc86af994ff3b7a3facbeda06a42 \
+          --namespace $NAMESPACE \
+          --from-env-file=.env \
+          --dry-run=client -o yaml | kubectl apply -n $NAMESPACE -f -
+
+    - name: Deploy to EKS ( $NAMESPACE namespace )
+      uses: ./.github/actions/log-streamer
+      env:
+        BST_TOKEN: ${{ secrets.BACKSTRACT_AUTH_TOKEN }}
+        INFRA_DIR: infra/k8s
+      with:
+        step_name: "Deploy to AWS EKS Cluster"
+        command: |
+          if [ -z "${BST_TOKEN}" ]; then
+            echo "ERROR: BACKSTRACT_AUTH_TOKEN is empty"
+            exit 1
+          fi
+
+          echo "🚀 Deploying to namespace: $NAMESPACE"
+
+          # ✅ Ensure namespace exists
+          kubectl get namespace $NAMESPACE || kubectl create namespace $NAMESPACE
+
+          # ✅ Apply configs
+          kubectl apply -n $NAMESPACE -f infra/k8s/alloy-rbac.yaml
+          kubectl apply -n $NAMESPACE -f infra/k8s/alloy-configmap.yaml
+          kubectl apply -f infra/k8s/aws-auth.yaml
+          kubectl apply -n $NAMESPACE -f infra/k8s/env-configmap.yaml
+          kubectl apply -n $NAMESPACE -f infra/k8s/http-scaled-object.yaml
+
+          # ✅ Inject token into deployment
+          awk -v token="${BST_TOKEN}" '{gsub(/PLACEHOLDER_BST_TOKEN_REPLACE_AT_RUNTIME/, token)}1' "$INFRA_DIR/deployment.yaml" > /tmp/deployment.yaml
+
+          if grep -q "PLACEHOLDER_BST_TOKEN_REPLACE_AT_RUNTIME" /tmp/deployment.yaml; then
+            echo "ERROR: Token injection failed"
+            exit 1
+          fi
+
+          # ✅ Deploy app
+          kubectl apply -n $NAMESPACE -f /tmp/deployment.yaml
+          kubectl apply -n $NAMESPACE -f "$INFRA_DIR/service.yaml"
+
+          # ✅ Restart deployment to apply changes
+          kubectl rollout restart deployment "majestic-bohr-ba7ba4674f-depl" -n $NAMESPACE
+
+          # ✅ Wait for rollout to complete and check status
+          kubectl rollout status deployment "majestic-bohr-ba7ba4674f-depl" -n $NAMESPACE
+
+          # ✅ Wait until deployed app docs endpoint is live
+          TARGET_HOST='https://cc1fbde45ead-in-south-01.mayson.dev'
+          TARGET_RPN_PATH='us-east-2-backstractelb-ebf9f5-coll-f696cc86af994ff3b7a3facbeda06a42'
+          DOCS_URL='https://cc1fbde45ead-in-south-01.mayson.dev/us-east-2-backstractelb-ebf9f5-coll-f696cc86af994ff3b7a3facbeda06a42/docs'
+          MAX_RETRIES=30
+          SLEEP_SECONDS=10
+
+          echo "🔎 Waiting for docs endpoint: ${DOCS_URL}"
+          for attempt in $(seq 1 "${MAX_RETRIES}"); do
+            status_code=$(curl -s -o /dev/null -w "%{http_code}" "${DOCS_URL}" || true)
+            if [ "${status_code}" = "200" ]; then
+              echo "✅ Docs endpoint is live (attempt ${attempt}/${MAX_RETRIES})"
+              break
+            fi
+
+            if [ "${attempt}" -eq "${MAX_RETRIES}" ]; then
+              echo "❌ Docs endpoint did not become live after ${MAX_RETRIES} attempts"
+              exit 1
+            fi
+
+            echo "Attempt ${attempt}/${MAX_RETRIES} failed (status: ${status_code:-none}), retrying in ${SLEEP_SECONDS}s..."
+            sleep "${SLEEP_SECONDS}"
+          done
+
+
+          # ✅ Strict smoke check: proceed only if /docs returns 200 right now
+          smoke_status=$(curl -s -o /dev/null -w "%{http_code}" "${DOCS_URL}" || true)
+          if [ "${smoke_status}" != "200" ]; then
+            echo "❌ Smoke check failed. ${DOCS_URL} returned status ${smoke_status:-none}"
+            exit 1
+          fi
+          echo "✅ Smoke check passed with 200 on ${DOCS_URL}"
+
+          # ✅ Debug output
+          echo "📦 Deployments:"
+          kubectl get deployments -n $NAMESPACE
+
+          echo "📦 Pods:"
+          kubectl get pods -n $NAMESPACE -l "app=majestic-bohr-ba7ba4674f"
+        endpoint: https://cc1fbde45ead-in-south-01.mayson.dev/sigma/api/v1/logs/github
+        token: ${{ secrets.BACKSTRACT_AUTH_TOKEN }}

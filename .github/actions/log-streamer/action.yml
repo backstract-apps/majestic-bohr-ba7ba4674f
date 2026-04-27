@@ -1,0 +1,89 @@
+name: BackStract GitHub Actions Log Streamer
+description: Stream shell command logs to BackStract's backend in real time.
+
+inputs:
+  command:
+    description: Shell command to run
+    required: true
+  endpoint:
+    description: Log streaming HTTP endpoint
+    required: true
+  token:
+    description: Auth token
+    required: true
+  step_name:
+    description: Name of the deployment step
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        STEP_NAME: ${{ inputs.step_name }}
+        STREAM_ENDPOINT: ${{ inputs.endpoint }}
+        STREAM_TOKEN: ${{ inputs.token }}
+      run: |
+        #!/usr/bin/env bash
+        set -eo pipefail
+
+        buffer=()
+
+        flush() {
+          if [ "${#buffer[@]}" -eq 0 ]; then
+            return
+          fi
+
+          json=$(jq -nc \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg step "$STEP_NAME" \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg branch "$GITHUB_REF_NAME" \
+            --arg commit_sha "$GITHUB_SHA" \
+            --arg actor "$GITHUB_ACTOR" \
+            --argjson logs "$(printf '%s\n' "${buffer[@]}" | jq -R . | jq -s .)" \
+            '{run_id: $run_id, step: $step, repository: $repo, branch: $branch, commit_sha: $commit_sha, actor: $actor, logs: $logs}')
+
+          curl -s -X POST "$STREAM_ENDPOINT" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $STREAM_TOKEN" \
+            -d "$json" > /dev/null || true
+
+          buffer=()
+        }
+
+        command_exit_code=0
+        temp_file=$(mktemp)
+        script_file=$(mktemp)
+
+        trap 'rm -f "$temp_file" "$script_file"' EXIT
+
+        # Write command safely into temp script
+        cat <<'EOF' > "$script_file"
+        ${{ inputs.command }}
+        EOF
+
+        chmod +x "$script_file"
+
+        set +e
+        bash "$script_file" 2>&1 | tee "$temp_file"
+        command_exit_code="${PIPESTATUS[0]}"
+        set -e
+
+        while IFS= read -r line; do
+          buffer+=("$line")
+          if [ "${#buffer[@]}" -ge 10 ]; then
+            flush
+          fi
+        done < "$temp_file"
+
+        flush
+
+        if [[ "$STEP_NAME" == "Deploy to AWS EKS Cluster" ]]; then
+          if [ "${#buffer[@]}" -eq 0 ]; then
+            buffer+=("Step completed with exit code: $command_exit_code")
+          fi
+          flush
+        fi
+
+        exit "$command_exit_code"
